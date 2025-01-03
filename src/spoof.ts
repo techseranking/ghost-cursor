@@ -1,4 +1,4 @@
-import type { ElementHandle, Page, BoundingBox, CDPSession, Protocol } from 'puppeteer'
+import type { ElementHandle, Page, BoundingBox, CDPSession, Frame } from 'puppeteer'
 import debug from 'debug'
 import {
   type Vector,
@@ -10,7 +10,6 @@ import {
   origin,
   overshoot
 } from './math'
-export { default as installMouseHelper } from './mouse-helper'
 
 const log = debug('ghost-cursor')
 
@@ -106,11 +105,13 @@ export interface GhostCursor {
   toggleRandomMove: (random: boolean) => void
   click: (
     selector?: string | ElementHandle,
-    options?: ClickOptions
+    options?: ClickOptions,
+    frame?: Frame
   ) => Promise<void>
   move: (
     selector: string | ElementHandle,
-    options?: MoveOptions
+    options?: MoveOptions,
+    frame?: Frame
   ) => Promise<void>
   moveTo: (destination: Vector, options?: MoveToOptions) => Promise<void>
   getLocation: () => Vector
@@ -363,29 +364,17 @@ export const createCursor = (
     vectors: Iterable<Vector | TimedVector>,
     abortOnMove: boolean = false
   ): Promise<void> => {
-    const cdpClient = getCDPClient(page)
-
     for (const v of vectors) {
       try {
         // In case this is called from random mouse movements and the users wants to move the mouse, abort
         if (abortOnMove && moving) {
           return
         }
-
-        const dispatchParams: Protocol.Input.DispatchMouseEventRequest = {
-          type: 'mouseMoved',
-          x: v.x,
-          y: v.y
-        }
-
-        if ('timestamp' in v) dispatchParams.timestamp = v.timestamp
-
-        await cdpClient.send('Input.dispatchMouseEvent', dispatchParams)
-
+        await page.mouse.move(v.x, v.y)
         previous = v
       } catch (error) {
         // Exit function if the browser is no longer connected
-        if (!page.browser().isConnected()) return
+        if (!page.browser().connected) return
 
         log('Warning: could not move mouse, error message:', error)
       }
@@ -427,7 +416,8 @@ export const createCursor = (
 
     async click (
       selector?: string | ElementHandle,
-      options?: ClickOptions
+      options?: ClickOptions,
+      frame?: Frame
     ): Promise<void> {
       const optionsResolved = {
         moveDelay: 2000,
@@ -446,7 +436,8 @@ export const createCursor = (
           ...optionsResolved,
           // apply moveDelay after click, but not after actual move
           moveDelay: 0
-        })
+        },
+        frame)
       }
 
       try {
@@ -465,7 +456,8 @@ export const createCursor = (
 
     async move (
       selector: string | ElementHandle,
-      options?: MoveOptions
+      options?: MoveOptions,
+      frame?: Frame
     ): Promise<void> {
       const optionsResolved = {
         moveDelay: 0,
@@ -484,7 +476,8 @@ export const createCursor = (
         }
 
         actions.toggleRandomMove(false)
-        let elem: ElementHandle<Element> | null = null
+        let elem: ElementHandle<Element> | null
+        const shouldUseFrame = frame !== null && frame !== undefined
         if (typeof selector === 'string') {
           if (selector.startsWith('//') || selector.startsWith('(//')) {
             selector = `xpath/.${selector}`
@@ -493,15 +486,30 @@ export const createCursor = (
                 timeout: optionsResolved.waitForSelector
               })
             }
-            const [handle] = await page.$$(selector)
+            let handle: ElementHandle
+            if (shouldUseFrame) {
+              [handle] = await frame.$$(selector)
+            } else {
+              [handle] = await page.$$(selector)
+            }
             elem = handle.asElement() as ElementHandle<Element>
           } else {
             if (optionsResolved.waitForSelector !== undefined) {
-              await page.waitForSelector(selector, {
-                timeout: optionsResolved.waitForSelector
-              })
+              if (shouldUseFrame) {
+                await frame.waitForSelector(selector, {
+                  timeout: optionsResolved.waitForSelector
+                })
+              } else {
+                await page.waitForSelector(selector, {
+                  timeout: optionsResolved.waitForSelector
+                })
+              }
             }
-            elem = await page.$(selector)
+            if (shouldUseFrame) {
+              elem = await frame.$(selector)
+            } else {
+              elem = await page.$(selector)
+            }
           }
           if (elem === null) {
             throw new Error(
@@ -559,7 +567,7 @@ export const createCursor = (
 
         // It's possible that the element that is being moved towards
         // has moved to a different location by the time
-        // the the time the mouseover animation finishes
+        // the mouseover animation finishes
         if (!intersectsElement(to, newBoundingBox)) {
           return await go(iteration + 1)
         }
